@@ -1,0 +1,400 @@
+param(
+    [Parameter(Mandatory=$false)]
+    [ValidateSet('msvc', 'gcc', 'auto')]
+    [string]$Compiler = 'auto',
+
+    [Parameter(Mandatory=$false)]
+    [switch]$NoSign
+)
+
+$WinDivertPath = "C:\WinDivert-2.2.2-A"
+$SourcePath = "src"
+# Core split across modular translation units (see src\pb_internal.h).
+$SourceFile = "ProxyBridge.c pb_util.c pb_process.c pb_rules.c pb_proxy.c pb_dns.c pb_socks5.c pb_http.c pb_conntrack.c pb_relay.c pb_sockmap.c"
+$SourceFiles = ($SourceFile.Split(' ') | ForEach-Object { "$SourcePath\$_" }) -join ' '
+$OutputDLL = "ProxyBridgeCore.dll"
+$OutputDir = "output"
+
+$SignTool = "signtool.exe"
+$CertThumbprint = ""
+$TimestampServer = "http://timestamp.digicert.com"
+
+$Arch = if ([Environment]::Is64BitProcess) { "x64" } else { "x86" }
+Write-Host "Architecture: $Arch" -ForegroundColor Cyan
+
+if (Test-Path $OutputDir) {
+    Write-Host "Cleaning output directory..." -ForegroundColor Yellow
+    Get-ChildItem -Path $OutputDir -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+Write-Host "Creating output directory: $OutputDir" -ForegroundColor Cyan
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+
+if (-not (Test-Path $WinDivertPath)) {
+    Write-Host "ERROR: WinDivert not found at: $WinDivertPath" -ForegroundColor Red
+    Write-Host "Please update the path in this script or install WinDivert" -ForegroundColor Yellow
+    exit 1
+}
+
+function Compile-MSVC {
+    Write-Host "`nCompiling DLL with MSVC..." -ForegroundColor Green
+
+    $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+    if (-not (Test-Path $vsWhere)) {
+        Write-Host "Visual Studio not found" -ForegroundColor Yellow
+        return $false
+    }
+
+    $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $vsPath) {
+        Write-Host "Visual Studio C++ tools not found" -ForegroundColor Yellow
+        return $false
+    }
+
+    $vcvarsPath = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+    if (-not (Test-Path $vcvarsPath)) {
+        Write-Host "vcvarsall.bat not found" -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Host "Found Visual Studio at: $vsPath" -ForegroundColor Cyan
+    $script:foundVcvarsPath = $vcvarsPath
+    $script:foundArch = $Arch
+
+    $clArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
+              "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
+              "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
+              "/I`"$WinDivertPath\include`" " +
+              "$SourceFiles " +
+              "src\core.res " +
+              "/LD " +
+              "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT " +
+              "/LIBPATH:`"$WinDivertPath\$Arch`" " +
+              "WinDivert.lib ws2_32.lib iphlpapi.lib " +
+              "/OUT:$OutputDLL"
+
+    $cmd = "`"$vcvarsPath`" $Arch >nul && rc /nologo /fo src\core.res src\core.rc && cl.exe $clArgs"
+
+    Write-Host "Command: cl.exe $clArgs" -ForegroundColor Gray
+
+    $result = cmd /c $cmd '2>&1'
+    $exitCode = $LASTEXITCODE
+    Remove-Item "src\core.res" -Force -ErrorAction SilentlyContinue
+
+    Write-Host $result
+
+    return $exitCode -eq 0
+}
+
+function Compile-GCC {
+    Write-Host "`nCompiling DLL with GCC..." -ForegroundColor Green
+
+    $gccVersion = cmd /c gcc --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "GCC not found in PATH" -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Host "GCC found: $($gccVersion[0])" -ForegroundColor Cyan
+
+    $cmd = "gcc -shared -O2 -s -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
+           "-I`"$WinDivertPath\include`" " +
+           "$SourceFiles " +
+           "-L`"$WinDivertPath\$Arch`" " +
+           "-lWinDivert -lws2_32 -liphlpapi -ladvapi32 " +
+           "-o $OutputDLL"
+
+    Write-Host "Command: $cmd" -ForegroundColor Gray
+
+    $result = cmd /c $cmd '2>&1'
+    $exitCode = $LASTEXITCODE
+
+    Write-Host $result
+
+    return $exitCode -eq 0
+}
+
+function Sign-Binary {
+    param(
+        [string]$FilePath
+    )
+
+    if (-not (Test-Path $FilePath)) {
+        Write-Host "  File not found: $FilePath" -ForegroundColor Red
+        return $false
+    }
+
+    $fileName = Split-Path $FilePath -Leaf
+
+    if ($fileName -like "WinDivert*") {
+        Write-Host "  Skipped: $fileName (WinDivert is already EV signed)" -ForegroundColor Yellow
+        return $true
+    }
+
+    Write-Host "  Signing: $fileName" -ForegroundColor Cyan
+
+    if ([string]::IsNullOrEmpty($CertThumbprint)) {
+        $cmd = "signtool.exe sign /a /fd SHA256 /tr `"$TimestampServer`" /td SHA256 `"$FilePath`""
+    } else {
+        $cmd = "signtool.exe sign /sha1 $CertThumbprint /fd SHA256 /tr `"$TimestampServer`" /td SHA256 `"$FilePath`""
+    }
+
+    $result = cmd /c $cmd '2>&1'
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -eq 0) {
+        Write-Host "    ✓ Signed successfully" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "    ✗ Signing failed: $result" -ForegroundColor Red
+        return $false
+    }
+}
+
+
+
+
+$success = $false
+
+if ($Compiler -eq 'auto') {
+    Write-Host "Auto-detecting compiler..." -ForegroundColor Cyan
+
+    $success = Compile-MSVC
+
+    if (-not $success) {
+        Write-Host "`nMSVC compilation failed, trying GCC..." -ForegroundColor Yellow
+        $success = Compile-GCC
+    }
+} elseif ($Compiler -eq 'msvc') {
+    $success = Compile-MSVC
+} elseif ($Compiler -eq 'gcc') {
+    $success = Compile-GCC
+}
+
+
+if ($success) {
+    Write-Host "`nCompilation SUCCESSFUL!" -ForegroundColor Green
+
+    Write-Host "`nCleaning up intermediate files..." -ForegroundColor Yellow
+    $intermediateFiles = @("*.obj", "*.exp", "*.lib", "ProxyBridge.obj")
+    foreach ($pattern in $intermediateFiles) {
+        Get-ChildItem -Path . -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item $_.FullName -Force
+            Write-Host "  Removed: $($_.Name)" -ForegroundColor Gray
+        }
+    }
+
+    Write-Host "`nMoving files to output directory..." -ForegroundColor Green
+    Move-Item $OutputDLL -Destination $OutputDir -Force
+    Write-Host "  Moved: $OutputDLL -> $OutputDir\" -ForegroundColor Gray
+
+    $files = @(
+        "$WinDivertPath\$Arch\WinDivert.dll",
+        "$WinDivertPath\$Arch\WinDivert64.sys",
+        "$WinDivertPath\$Arch\WinDivert32.sys"
+    )
+    foreach ($file in $files) {
+        if (Test-Path $file) {
+            Copy-Item $file -Destination $OutputDir -Force
+            Write-Host "  Copied: $(Split-Path $file -Leaf)" -ForegroundColor Gray
+        }
+    }
+
+    # ── C GUI ─────────────────────────────────────────────────────────
+    # Single self-contained ProxyBridge.exe that loads ProxyBridgeCore.dll from its folder.
+    Write-Host "`nBuilding C GUI..." -ForegroundColor Green
+    if ($script:foundVcvarsPath -and (Test-Path $script:foundVcvarsPath)) {
+        $guiClArgs = "/nologo /utf-8 /O1 /Os /MT /GL /Gy /GS /guard:cf /sdl /W4 " +
+                     "/DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE " +
+                     "main.c profile\profile.c app.res " +
+                     "/Fe:ProxyBridge.exe " +
+                     "/link /LTCG /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /RELEASE " +
+                     "/DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf /CETCOMPAT " +
+                     "user32.lib gdi32.lib comctl32.lib shell32.lib comdlg32.lib winhttp.lib advapi32.lib"
+
+        Push-Location "gui"
+        $guiCmd = "`"$script:foundVcvarsPath`" $script:foundArch >nul && " +
+                  "pushd res && rc /nologo /fo ..\app.res app.rc && popd && cl.exe $guiClArgs"
+        $guiOut  = cmd /c $guiCmd '2>&1'
+        $guiExit = $LASTEXITCODE
+        Pop-Location
+
+        if ($guiExit -eq 0 -and (Test-Path "gui\ProxyBridge.exe")) {
+            Move-Item "gui\ProxyBridge.exe" -Destination $OutputDir -Force
+            Write-Host "  C GUI built (MSVC): ProxyBridge.exe" -ForegroundColor Gray
+            Remove-Item "gui\*.obj","gui\app.res" -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "  C GUI build failed!" -ForegroundColor Red
+            Write-Host $guiOut
+        }
+    } else {
+        Write-Host "  Building C GUI with GCC..." -ForegroundColor Green
+        Push-Location "gui"
+        cmd /c "pushd res && windres app.rc -o app.o && popd"
+        $gccGuiCmd = "gcc -O2 -s -DNDEBUG -D_CRT_SECURE_NO_WARNINGS -DUNICODE -D_UNICODE -mwindows -municode main.c profile/profile.c res/app.o -luser32 -lgdi32 -lcomctl32 -lshell32 -lcomdlg32 -lwinhttp -ladvapi32 -lole32 -luxtheme -ldwmapi -luuid -o ProxyBridge.exe"
+        $guiOut = cmd /c $gccGuiCmd '2>&1'
+        $guiExit = $LASTEXITCODE
+        Pop-Location
+        if ($guiExit -eq 0 -and (Test-Path "gui\ProxyBridge.exe")) {
+            Move-Item "gui\ProxyBridge.exe" -Destination $OutputDir -Force
+            Write-Host "  C GUI built (GCC): ProxyBridge.exe" -ForegroundColor Gray
+            Remove-Item "gui\res\app.o" -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "  C GUI build failed!" -ForegroundColor Red
+            Write-Host $guiOut
+        }
+    }
+
+    # ── Build CLI ────────────────────────────────────────────────────────────
+    Write-Host "`nBuilding CLI..." -ForegroundColor Green
+    if ($script:foundVcvarsPath -and (Test-Path $script:foundVcvarsPath)) {
+        $cliArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
+                   "/D_WINSOCK_DEPRECATED_NO_WARNINGS /D_WIN32_WINNT=0x0601 /DNDEBUG " +
+                   "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
+                   "cli\main.c cli\cli.res " +
+                   "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT /SUBSYSTEM:CONSOLE " +
+                   "winhttp.lib shell32.lib advapi32.lib " +
+                   "/OUT:ProxyBridge_CLI.exe"
+
+        $cliCmd = "`"$script:foundVcvarsPath`" $script:foundArch >nul && rc /nologo /fo cli\cli.res cli\cli.rc && cl.exe $cliArgs"
+        Write-Host "Command: cl.exe $cliArgs" -ForegroundColor Gray
+
+        $cliOut = cmd /c $cliCmd '2>&1'
+        $cliExit = $LASTEXITCODE
+        Remove-Item "cli\cli.res" -Force -ErrorAction SilentlyContinue
+        if ($cliExit -eq 0) {
+            Move-Item "ProxyBridge_CLI.exe" -Destination $OutputDir -Force
+            Write-Host "  CLI built (MSVC): ProxyBridge_CLI.exe" -ForegroundColor Gray
+            Remove-Item "*.obj" -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "  CLI build failed!" -ForegroundColor Red
+            Write-Host $cliOut
+        }
+    } else {
+        Write-Host "  Building CLI with GCC..." -ForegroundColor Green
+        cmd /c "pushd cli && windres cli.rc -o cli.o && popd"
+        $gccCliCmd = "gcc -O2 -s -DNDEBUG -D_WIN32_WINNT=0x0601 cli/main.c cli/cli.o -lwinhttp -lshell32 -ladvapi32 -lws2_32 -o ProxyBridge_CLI.exe"
+        $cliOut = cmd /c $gccCliCmd '2>&1'
+        $cliExit = $LASTEXITCODE
+        Remove-Item "cli\cli.o" -Force -ErrorAction SilentlyContinue
+        if ($cliExit -eq 0) {
+            Move-Item "ProxyBridge_CLI.exe" -Destination $OutputDir -Force
+            Write-Host "  CLI built (GCC): ProxyBridge_CLI.exe" -ForegroundColor Gray
+        } else {
+            Write-Host "  CLI build failed!" -ForegroundColor Red
+            Write-Host $cliOut
+        }
+    }
+
+    # ── Build engine service ─────────────────────────────────────────────────
+    Write-Host "`nBuilding service..." -ForegroundColor Green
+    if ($script:foundVcvarsPath -and (Test-Path $script:foundVcvarsPath)) {
+        $svcArgs = "/nologo /O2 /GL /Gy /W4 /MT /GS /guard:cf /sdl /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE " +
+                   "src\service\pb_service.c src\service\svc.res " +
+                   "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf /CETCOMPAT /SUBSYSTEM:CONSOLE " +
+                   "advapi32.lib " +
+                   "/OUT:ProxyBridgeSvc.exe"
+        $svcCmd = "`"$script:foundVcvarsPath`" $script:foundArch >nul && rc /nologo /fo src\service\svc.res src\service\svc.rc && cl.exe $svcArgs"
+        $svcOut = cmd /c $svcCmd '2>&1'
+        $svcExit = $LASTEXITCODE
+        Remove-Item "src\service\svc.res" -Force -ErrorAction SilentlyContinue
+        if ($svcExit -eq 0) {
+            Move-Item "ProxyBridgeSvc.exe" -Destination $OutputDir -Force
+            Write-Host "  Service built (MSVC): ProxyBridgeSvc.exe" -ForegroundColor Gray
+            Remove-Item "*.obj" -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "  Service build failed!" -ForegroundColor Red
+            Write-Host $svcOut
+        }
+    } else {
+        Write-Host "  Building Service with GCC..." -ForegroundColor Green
+        cmd /c "pushd src\service && windres svc.rc -o svc.o && popd"
+        $gccSvcCmd = "gcc -O2 -s -DNDEBUG -DUNICODE -D_UNICODE -municode src/service/pb_service.c src/service/svc.o -ladvapi32 -lnetapi32 -lwtsapi32 -o ProxyBridgeSvc.exe"
+        $svcOut = cmd /c $gccSvcCmd '2>&1'
+        $svcExit = $LASTEXITCODE
+        Remove-Item "src\service\svc.o" -Force -ErrorAction SilentlyContinue
+        if ($svcExit -eq 0) {
+            Move-Item "ProxyBridgeSvc.exe" -Destination $OutputDir -Force
+            Write-Host "  Service built (GCC): ProxyBridgeSvc.exe" -ForegroundColor Gray
+        } else {
+            Write-Host "  Service build failed!" -ForegroundColor Red
+            Write-Host $svcOut
+        }
+    }
+
+    $hasSignTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue) -ne $null
+    if (-not $NoSign -and $hasSignTool) {
+        Write-Host "`nSigning binaries..." -ForegroundColor Green
+        $filesToSign = Get-ChildItem $OutputDir -Include *.exe,*.dll -Recurse
+        $signedCount = 0
+        $skippedCount = 0
+
+        foreach ($file in $filesToSign) {
+            if ($file.Name -like "WinDivert*") {
+                Write-Host "  Skipped: $($file.Name) (WinDivert is already EV signed)" -ForegroundColor Yellow
+                $skippedCount++
+            } else {
+                if (Sign-Binary -FilePath $file.FullName) {
+                    $signedCount++
+                }
+            }
+        }
+
+        Write-Host "`nSigning Summary:" -ForegroundColor Cyan
+        Write-Host "  Signed: $signedCount files" -ForegroundColor Green
+        Write-Host "  Skipped: $skippedCount files (WinDivert)" -ForegroundColor Yellow
+    } else {
+        if (-not $hasSignTool) {
+            Write-Host "`nSigning skipped (signtool.exe not found)" -ForegroundColor Yellow
+        } else {
+            Write-Host "`nSigning skipped (-NoSign flag)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "`nAll files ready in: $OutputDir\" -ForegroundColor Cyan
+    Write-Host "Contents:" -ForegroundColor Yellow
+    Get-ChildItem $OutputDir | ForEach-Object {
+        $size = [math]::Round($_.Length/1MB, 2)
+        Write-Host "  - $($_.Name) ($size MB)" -ForegroundColor Gray
+    }
+
+    Write-Host "`nBuilding installer..." -ForegroundColor Green
+    $nsisPath = "C:\Program Files (x86)\NSIS\Bin\makensis.exe"
+    if (Test-Path $nsisPath) {
+        Push-Location installer
+        $result = & $nsisPath "ProxyBridge.nsi" 2>&1
+        Pop-Location
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Installer created successfully" -ForegroundColor Green
+            # Derive installer name from the version defined in the NSI file
+            $nsiContent = Get-Content "installer\ProxyBridge.nsi" -Raw -ErrorAction SilentlyContinue
+            $installerVersion = if ($nsiContent -match '!define PRODUCT_VERSION "([^"]+)"') { $Matches[1] } else { "0.0.0" }
+            $installerName = "ProxyBridge-Setup-$installerVersion.exe"
+            if (Test-Path "installer\$installerName") {
+                Move-Item "installer\$installerName" -Destination $OutputDir -Force
+                Write-Host "  Moved: $installerName -> $OutputDir\" -ForegroundColor Gray
+
+                if (-not $NoSign) {
+                    Write-Host "`nSigning installer..." -ForegroundColor Green
+                    if (Sign-Binary -FilePath "$OutputDir\$installerName") {
+                        $installerSize = [math]::Round((Get-Item "$OutputDir\$installerName").Length/1MB, 2)
+                        Write-Host "  Installer ready: $OutputDir\$installerName ($installerSize MB)" -ForegroundColor Cyan
+                    }
+                } else {
+                    $installerSize = [math]::Round((Get-Item "$OutputDir\$installerName").Length/1MB, 2)
+                    Write-Host "  Installer ready: $OutputDir\$installerName ($installerSize MB)" -ForegroundColor Cyan
+                }
+            }
+        } else {
+            Write-Host "  Installer build failed!" -ForegroundColor Red
+            Write-Host $result
+        }
+    } else {
+        Write-Host "  NSIS not found at: $nsisPath" -ForegroundColor Yellow
+        Write-Host "  Skipping installer creation" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "`nCompilation FAILED!" -ForegroundColor Red
+    Write-Host "Need: Visual Studio with C++ or MinGW-w64" -ForegroundColor Yellow
+    exit 1
+}

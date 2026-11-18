@@ -1,0 +1,227 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ "master", "dev" ]
+  pull_request:
+    branches: [ "master", "dev" ]
+  schedule:
+    - cron: '0 4 * * 1'
+
+jobs:
+
+  analyze-windows:
+    name: Analyze (c-cpp, windows)
+    runs-on: windows-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          languages: c-cpp
+
+      - name: Download WinDivert
+        run: |
+          $url = "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
+          $expectedHash = "63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15"
+          Invoke-WebRequest -Uri $url -OutFile "WinDivert.zip" -UseBasicParsing
+          $actualHash = (Get-FileHash "WinDivert.zip" -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            Write-Error "WinDivert.zip SHA256 mismatch! Expected: $expectedHash  Got: $actualHash"
+            exit 1
+          }
+          Expand-Archive -Path "WinDivert.zip" -DestinationPath "C:\"
+        shell: pwsh
+
+      - name: Build (MSVC)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          # Compile-only (/c) so CodeQL traces every C translation unit without needing
+          # WinDivert.lib, NSIS or the linker.
+          $common = "/nologo /c /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /GS /guard:cf"
+
+          # Every .c file of each part is listed from the folder, so a new source file is covered
+          # without touching this workflow (the engine is split into many pb_*.c files).
+          function Compile($dir, $extra) {
+            $files = (Get-ChildItem $dir -Filter *.c -File | ForEach-Object { Join-Path $dir $_.Name }) -join " "
+            if (-not $files) { throw "no C files found in $dir" }
+            cmd /c "`"$vcvars`" && cl.exe $common $extra $files"
+            if ($LASTEXITCODE -ne 0) { throw "compile failed in $dir" }
+          }
+
+          # Core DLL
+          Compile "Windows\src" "/DPROXYBRIDGE_EXPORTS /I`"C:\WinDivert-2.2.2-A\include`""
+          # Engine service (runs as LocalSystem)
+          Compile "Windows\src\service" "/D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE"
+          # CLI
+          Compile "Windows\cli" "/D_WIN32_WINNT=0x0601 /DUNICODE /D_UNICODE"
+          # Native C GUI: built from its own folder so the subfolder includes resolve
+          Push-Location Windows\gui
+          $guiFiles = (Get-ChildItem . -Filter *.c -File -Recurse | ForEach-Object { Resolve-Path -Relative $_.FullName }) -join " "
+          cmd /c "`"$vcvars`" && cl.exe $common /utf-8 /DUNICODE /D_UNICODE $guiFiles"
+          if ($LASTEXITCODE -ne 0) { throw "compile failed in Windows\gui" }
+          Pop-Location
+
+      # fail instead of silently losing coverage when C code appears outside the folders compiled above.
+      # Windows\tests holds the test programs (built by tests\run_tests.ps1 in the Windows build workflow). They are not
+      # shipped, and they compile the real sources from src, cli and gui, which are analysed above.
+      - name: Check every Windows C file is covered
+        shell: pwsh
+        run: |
+          $stray = Get-ChildItem Windows -Filter *.c -File -Recurse |
+            Where-Object { $_.FullName -notmatch '\\Windows\\(src|cli|gui|tests)\\' }
+          if ($stray) {
+            $stray | ForEach-Object { Write-Host "not covered by CodeQL: $($_.FullName)" }
+            throw "C files outside Windows\src, cli and gui are not compiled by this workflow, add them to the Build step"
+          }
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          category: "/language:c-cpp"
+
+  analyze-macos:
+    name: Analyze (swift, macos)
+    runs-on: macos-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          languages: swift
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Create stub xcconfig files
+        run: |
+          cat > MacOS/ProxyBridge/Signing-Config-app.xcconfig << 'EOF'
+          PRODUCT_MODULE_NAME = ProxyBridge
+          PRODUCT_NAME = ProxyBridge
+          PRODUCT_BUNDLE_IDENTIFIER = com.interceptsuite.ProxyBridge
+          ARCHS = arm64 x86_64
+          ONLY_ACTIVE_ARCH = NO
+          EOF
+          # PRODUCT_NAME must match the extension's product filename recorded in the
+          # Xcode project (com.interceptsuite.ProxyBridge.extension.systemextension),
+          # otherwise the app target's "Embed System Extensions" copy phase fails with
+          # "no such file". The module name stays the sanitized identifier.
+          cat > MacOS/ProxyBridge/Signing-Config-ext.xcconfig << 'EOF'
+          PRODUCT_MODULE_NAME = com_interceptsuite_ProxyBridge_extension
+          PRODUCT_NAME = com.interceptsuite.ProxyBridge.extension
+          PRODUCT_BUNDLE_IDENTIFIER = com.interceptsuite.ProxyBridge.extension
+          ARCHS = arm64 x86_64
+          ONLY_ACTIVE_ARCH = NO
+          EOF
+
+      - name: Build (no signing)
+        run: |
+          cd MacOS/ProxyBridge
+          xcodebuild \
+            -project ProxyBridge.xcodeproj \
+            -scheme ProxyBridge \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean build
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          category: "/language:swift"
+
+  analyze-linux:
+    name: Analyze (c-cpp, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          languages: c-cpp
+
+      # same packages as the Build Linux workflow
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            make \
+            clang \
+            curl \
+            bzip2 \
+            linux-tools-common \
+            linux-tools-generic \
+            libbpf-dev \
+            libgtk-3-dev \
+            pkg-config
+        shell: bash
+
+      - name: Locate bpftool
+        # on Ubuntu "bpftool" is only a virtual package, the real binary ships in linux-tools-*
+        run: |
+          shopt -s nullglob
+          candidates=(/usr/lib/linux-tools/*/bpftool)
+          [ ${#candidates[@]} -gt 0 ] || { echo "bpftool binary not found"; ls /usr/lib/linux-tools 2>&1 || true; exit 1; }
+          echo "BPFTOOL=${candidates[0]}" >> "$GITHUB_ENV"
+          "${candidates[0]}" version | head -1
+        shell: bash
+
+      # build.sh compiles the library (src), the CLI and the GTK GUI, which is every C translation unit under
+      # Linux/. LTO and the binary audit are off (they only matter for the shipped binaries), and the system
+      # libbpf is used so CodeQL does not extract a downloaded copy of it.
+      - name: Build
+        run: |
+          cd Linux
+          chmod +x build.sh
+          LTO=0 AUDIT=0 STATIC_LIBBPF=0 ./build.sh
+        shell: bash
+
+      # build.sh covers src (library + eBPF program), cli, gui and the shared profile code. Unit-test and benchmark
+      # sources (tests/ folders) are not built here. Fail instead of silently losing coverage when product C code
+      # shows up somewhere else.
+      - name: Check every Linux product C file is covered
+        run: |
+          stray=$(find Linux -name '*.c' -not -path 'Linux/src/*' -not -path 'Linux/cli/*' -not -path 'Linux/gui/*' \
+                    -not -path 'Linux/profile/*' -not -path '*/tests/*' -not -path 'Linux/output/*')
+          if [ -n "$stray" ]; then
+            echo "not covered by CodeQL:"; echo "$stray"
+            echo "build.sh only builds Linux/src, cli, gui and profile, add the new code to the Build step"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          # a separate category from the Windows c-cpp job, otherwise the two uploads replace each other
+          category: "/language:c-cpp/os:linux"
